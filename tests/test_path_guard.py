@@ -1,3 +1,4 @@
+import ctypes
 import os
 from pathlib import Path
 import subprocess
@@ -58,8 +59,15 @@ def test_blocks_traversal_secrets_unc_dos_devices_and_relative_paths(tmp_path: P
         ssh_dir.mkdir()
         (ssh_dir / "id_rsa").write_text("PRIVATE", encoding="utf-8")
 
+        sub_dir = docs_dir / "sub"
+        sub_dir.mkdir()
+        notes = docs_dir / "notes.md"
+        notes.write_text("ok", encoding="utf-8")
+
         for bad_target in (
             str(docs_dir / ".." / "secret.txt"),
+            str(sub_dir / ".." / "notes.md"),
+            f"{docs_dir.as_posix()}/sub/../notes.md",
             str(docs_dir / ".env"),
             str(docs_dir / ".envrc"),
             str(docs_dir / "id_ecdsa"),
@@ -67,6 +75,10 @@ def test_blocks_traversal_secrets_unc_dos_devices_and_relative_paths(tmp_path: P
             str(ssh_dir / "id_rsa"),
             r"\\192.168.1.10\share\doc.txt",
             "//192.168.1.10/share/doc.txt",
+            r"\/server\share\x.txt",
+            r"/\127.0.0.1\c$\Windows",
+            r"\/.\NUL",
+            r"\\.\NUL",
             str(docs_dir / "notes.md:hidden_stream"),
             str(docs_dir / "NUL"),
             str(docs_dir / "COM1.txt"),
@@ -80,7 +92,7 @@ def test_blocks_traversal_secrets_unc_dos_devices_and_relative_paths(tmp_path: P
                 guard.validate_read_path(bad_target)
 
         audits = db.list_audits(decision="BLOCKED")
-        assert len(audits) >= 16
+        assert len(audits) >= 22
         assert issubclass(PathAccessDeniedError, PermissionError)
     finally:
         db.close()
@@ -98,15 +110,25 @@ def test_blocks_drive_root_userprofile_and_system_dirs(tmp_path: Path) -> None:
             str(win_dir) if win_dir.exists() else str(guard.config.data_dir),
             str(guard.config.data_dir),
             jawis_appdata,
+            str(Path.home() / ".jawis"),
             os.environ.get("SystemDrive", "C:") + "\\Users",
+            r"\/server\share",
+            r"/\127.0.0.1\c$\Windows",
         ):
             if bad_root:
                 with pytest.raises(PathAccessDeniedError):
                     guard.validate_folder_root(bad_root)
 
+        assert guard.is_sensitive_path(Path(r"\\server\share\doc.txt")) is True
+
         valid_root = tmp_path / "projects"
         valid_root.mkdir()
         assert guard.validate_folder_root(str(valid_root)) == valid_root.resolve()
+
+        nested_sub = valid_root / "sub"
+        nested_sub.mkdir()
+        with pytest.raises(PathAccessDeniedError):
+            guard.validate_folder_root(str(nested_sub / ".."))
 
         not_a_dir = valid_root / "file.txt"
         not_a_dir.write_text("content", encoding="utf-8")
@@ -140,12 +162,61 @@ def test_blocks_ntfs_junctions_and_symlinks(tmp_path: Path, monkeypatch: pytest.
             str(junc_out / "leak.txt"),
             str(junc_in),
             str(junc_in / "ok.txt"),
+            str(junc_in / ".." / "sub" / "ok.txt"),
         ):
             with pytest.raises(PathAccessDeniedError):
                 guard.validate_read_path(bad_path)
 
+        (outside_dir / "nested").mkdir()
         with pytest.raises(PathAccessDeniedError):
             guard.validate_folder_root(str(junc_out))
+        with pytest.raises(PathAccessDeniedError):
+            guard.validate_folder_root(str(junc_out / "nested"))
+
+        # Swapping an ancestor directory above a previously allowlisted root must also block access.
+        parent_dir = tmp_path / "parent_dir"
+        parent_dir.mkdir()
+        nested_root = parent_dir / "allowed"
+        nested_root.mkdir()
+        (nested_root / "ok.txt").write_text("ok", encoding="utf-8")
+        db.add_folder(str(nested_root), "NestedAllowed")
+
+        evil_parent = tmp_path / "evil_parent"
+        evil_parent.mkdir()
+        evil_allowed = evil_parent / "allowed"
+        evil_allowed.mkdir()
+        (evil_allowed / "ok.txt").write_text("evil", encoding="utf-8")
+
+        (nested_root / "ok.txt").unlink()
+        nested_root.rmdir()
+        parent_dir.rmdir()
+        _create_junction(parent_dir, evil_parent)
+
+        with pytest.raises(PathAccessDeniedError):
+            guard.validate_read_path(str(parent_dir / "allowed" / "ok.txt"))
+        with pytest.raises(PathAccessDeniedError):
+            guard.validate_read_path(str(evil_allowed / "ok.txt"))
+
+        # 8.3 short paths that lexically differ from stored root_path must still fail closed on junctions.
+        long_root = tmp_path / "Long Folder Name"
+        long_root.mkdir()
+        db.add_folder(str(long_root), "LongFolder")
+        long_sub = long_root / "target_sub"
+        long_sub.mkdir()
+        (long_sub / "allowed_ok.txt").write_text("ok", encoding="utf-8")
+        long_junc = long_root / "junc_link"
+        _create_junction(long_junc, long_sub)
+
+        junc_file = long_junc / "allowed_ok.txt"
+        short_buf = ctypes.create_unicode_buffer(1024)
+        short_len = ctypes.windll.kernel32.GetShortPathNameW(str(junc_file), short_buf, len(short_buf))
+        assert short_len > 0
+        short_junc_file = short_buf.value
+        assert short_junc_file != str(junc_file)
+        with pytest.raises(PathAccessDeniedError):
+            guard.validate_read_path(short_junc_file)
+        junc_audit = db.list_audits(decision="BLOCKED", limit=1)
+        assert "junction" in junc_audit[0].detail.lower()
 
         # Swapping a previously allowlisted root on disk with a junction must not grant access.
         swapped_root = tmp_path / "swapped_root"
@@ -210,5 +281,43 @@ def test_blocks_disabled_folders_outside_paths_and_records_audit_details(tmp_pat
         assert len(allowed) == 1
         assert allowed[0].target == str(docs_dir)
         assert allowed[0].detail == ""
+    finally:
+        db.close()
+
+
+def test_rejects_parent_traversal_mixed_unc_and_empty_system_drive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Test name intentionally avoids hard-denied substrings like "secret" so only path rules trigger.
+    guard, db, docs_dir = _make_guard(tmp_path)
+    try:
+        sub_dir = docs_dir / "sub"
+        sub_dir.mkdir()
+        notes = docs_dir / "notes.md"
+        notes.write_text("ok", encoding="utf-8")
+
+        for traversal in (
+            str(sub_dir / ".." / "notes.md"),
+            f"{docs_dir.as_posix()}/sub/../notes.md",
+        ):
+            with pytest.raises(PathAccessDeniedError):
+                guard.validate_read_path(traversal)
+        latest = db.list_audits(decision="BLOCKED", limit=2)
+        assert all(".." in entry.detail for entry in latest)
+
+        for mixed_unc in (
+            r"\/server\share\x.txt",
+            r"/\127.0.0.1\c$\Windows",
+            r"\/.\NUL",
+        ):
+            with pytest.raises(PathAccessDeniedError):
+                guard.validate_read_path(mixed_unc)
+        unc_audits = db.list_audits(decision="BLOCKED", limit=3)
+        assert all("UNC, ADS" in entry.detail for entry in unc_audits)
+
+        monkeypatch.setenv("SystemDrive", "")
+        guard_empty_sd = PathSecurityGuard(guard.config, db, AuditLogger(db))
+        with pytest.raises(PathAccessDeniedError):
+            guard_empty_sd.validate_folder_root(r"C:\Users")
     finally:
         db.close()

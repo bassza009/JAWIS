@@ -95,6 +95,10 @@ class PathSecurityGuard:
                     str(ra / "Mozilla" / "Firefox"),
                 ]
             )
+        try:
+            candidates.append(str(Path.home() / ".jawis"))
+        except (RuntimeError, OSError):
+            pass
         roots: list[Path] = []
         for item in candidates:
             if item:
@@ -108,13 +112,13 @@ class PathSecurityGuard:
     def _collect_exact_blocked_roots() -> tuple[Path, ...]:
         roots: list[Path] = []
         for env_key in ("USERPROFILE", "SystemDrive"):
-            val = os.environ.get(env_key)
+            val = (os.environ.get(env_key) or "").strip()
             if val:
                 try:
                     roots.append(PathSecurityGuard._resolve_normalized(val))
                 except OSError:
                     continue
-        sys_drive = os.environ.get("SystemDrive", "C:").rstrip("\\")
+        sys_drive = (os.environ.get("SystemDrive") or "C:").strip().rstrip("\\") or "C:"
         try:
             roots.append(PathSecurityGuard._resolve_normalized(f"{sys_drive}\\Users"))
         except OSError:
@@ -124,7 +128,7 @@ class PathSecurityGuard:
     @staticmethod
     def _has_ntfs_ads_or_unc(raw_path: str) -> bool:
         stripped = raw_path.strip()
-        if stripped.startswith("\\\\") or stripped.startswith("//"):
+        if stripped.replace("/", "\\").startswith("\\\\") or Path(stripped).drive.startswith("\\\\"):
             return True
         colon_count = stripped.count(":")
         if colon_count == 0:
@@ -144,8 +148,10 @@ class PathSecurityGuard:
         return False
 
     def is_sensitive_path(self, resolved: Path) -> bool:
-        """Return True if path falls inside JAWIS data, OS/browser dirs, or hard-denied patterns."""
+        """Return True if path falls inside JAWIS data, OS/browser dirs, UNC, or hard-denied patterns."""
         norm = self.normalize_long_path(resolved)
+        if norm.drive.startswith("\\\\"):
+            return True
         if norm == self._data_dir or norm.is_relative_to(self._data_dir):
             return True
         for sys_root in self._system_roots:
@@ -162,14 +168,15 @@ class PathSecurityGuard:
     def _is_blocked_root(self, resolved: Path) -> bool:
         return resolved == Path(resolved.anchor) or resolved in self._exact_blocked_roots
 
-    def _has_reparse_between(self, root: Path, candidate: Path) -> bool:
-        lex = self.normalize_long_path(Path(os.path.abspath(candidate)))
-        if not lex.is_relative_to(root):
-            return False
-        cur = lex
-        while cur != root:
+    def _has_reparse_in_chain(self, path: Path) -> bool:
+        """Return True if path or any ancestor up to its drive root is a reparse point."""
+        anchor = Path(path.anchor) if path.anchor else None
+        cur = path
+        while True:
             if self.is_reparse_point(cur):
                 return True
+            if anchor is not None and cur == anchor:
+                break
             parent = cur.parent
             if parent == cur:
                 break
@@ -187,7 +194,7 @@ class PathSecurityGuard:
         )
         return PathAccessDeniedError(reason)
 
-    def _validate_and_resolve_candidate(self, raw_path: str, tool_name: str) -> tuple[Path, Path]:
+    def _validate_and_resolve_candidate(self, raw_path: str, tool_name: str) -> Path:
         if (
             not raw_path
             or "\x00" in raw_path
@@ -196,19 +203,26 @@ class PathSecurityGuard:
         ):
             raise self._deny(tool_name, raw_path, "UNC, ADS, empty, or reserved device path rejected")
         candidate = Path(raw_path)
+        if candidate.drive.startswith("\\\\"):
+            raise self._deny(tool_name, raw_path, "UNC or device path rejected")
+        raw_segments = raw_path.replace("/", "\\").split("\\")
+        if ".." in raw_segments or ".." in candidate.parts:
+            raise self._deny(tool_name, raw_path, "Parent traversal '..' segment rejected")
         if not candidate.is_absolute():
             raise self._deny(tool_name, raw_path, "Relative path rejected")
-        if self.is_reparse_point(candidate) or self.is_reparse_point(Path(os.path.abspath(candidate))):
+        if self._has_reparse_in_chain(candidate):
             raise self._deny(tool_name, raw_path, "Symlink or directory junction rejected")
         try:
             resolved = self.normalize_long_path(candidate.resolve(strict=True))
         except OSError as exc:
             raise self._deny(tool_name, raw_path, f"Path cannot be resolved: {exc}") from exc
-        return candidate, resolved
+        return resolved
 
     def validate_folder_root(self, raw_path: str) -> Path:
         """Validate and canonicalize a candidate directory before adding to the allowlist."""
-        _, resolved = self._validate_and_resolve_candidate(raw_path, "add_folder")
+        resolved = self._validate_and_resolve_candidate(raw_path, "add_folder")
+        if resolved.drive.startswith("\\\\"):
+            raise self._deny("add_folder", raw_path, "UNC or device path cannot be allowlisted")
         if not resolved.is_dir():
             raise self._deny("add_folder", raw_path, "Target is not a directory")
         if self._is_blocked_root(resolved):
@@ -219,21 +233,24 @@ class PathSecurityGuard:
 
     def validate_read_path(self, raw_path: str, tool_name: str = "read_allowed_file") -> Path:
         """Validate that raw_path canonically resolves inside an enabled allowlisted folder."""
-        candidate, resolved = self._validate_and_resolve_candidate(raw_path, tool_name)
+        resolved = self._validate_and_resolve_candidate(raw_path, tool_name)
         if self.is_sensitive_path(resolved):
             raise self._deny(tool_name, str(resolved), "Blocked sensitive file or protected system path")
 
         for folder in self._db.list_folders(only_enabled=True):
             raw_root = Path(folder.root_path)
-            if self.is_reparse_point(raw_root):
+            if (
+                not raw_root.is_absolute()
+                or raw_root.drive.startswith("\\\\")
+                or ".." in raw_root.parts
+                or self._has_reparse_in_chain(raw_root)
+            ):
                 continue
             try:
                 root = self.normalize_long_path(raw_root.resolve(strict=True))
             except OSError:
                 continue
             if self._is_blocked_root(root) or self.is_sensitive_path(root):
-                continue
-            if self._has_reparse_between(root, candidate):
                 continue
             if resolved == root or resolved.is_relative_to(root):
                 return resolved
