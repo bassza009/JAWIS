@@ -41,6 +41,16 @@ class AppAllowlistGuard:
         )
         return AppAccessDeniedError(reason)
 
+    @staticmethod
+    def _has_ntfs_ads(raw_path: str) -> bool:
+        target = raw_path[4:] if raw_path.startswith("\\\\?\\") else raw_path
+        colon_count = target.count(":")
+        if colon_count == 0:
+            return False
+        if colon_count == 1 and len(target) >= 2 and target[1] == ":" and target[0].isalpha():
+            return False
+        return True
+
     def validate_registration(
         self,
         executable_path: str,
@@ -52,16 +62,16 @@ class AppAllowlistGuard:
         is_unc = stripped_exe.startswith(("\\\\", "//")) and not (
             stripped_exe.startswith("\\\\?\\") and not stripped_exe.upper().startswith("\\\\?\\UNC\\")
         )
-        if not stripped_exe or "\x00" in executable_path or is_unc:
+        if not stripped_exe or "\x00" in executable_path or is_unc or self._has_ntfs_ads(stripped_exe):
             raise self._deny(
                 "APP_REGISTER",
                 "user",
                 "register_app",
                 executable_path,
-                "Empty, UNC, or invalid executable path",
+                "Empty, UNC, ADS, or invalid executable path",
             )
         try:
-            resolved = Path(executable_path).resolve(strict=True)
+            resolved = Path(stripped_exe).resolve(strict=True)
         except (OSError, ValueError) as exc:
             raise self._deny(
                 "APP_REGISTER",

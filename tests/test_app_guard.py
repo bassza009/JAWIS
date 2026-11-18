@@ -62,7 +62,9 @@ def test_app_guard_resolves_unique_aliases_and_rejects_ambiguity(tmp_path: Path)
         db.close()
 
 
-def test_app_guard_blocks_scripts_lolbins_and_bad_args(tmp_path: Path) -> None:
+def test_app_guard_blocks_scripts_lolbins_and_bad_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = Database(tmp_path / "jawis.db")
     try:
         guard = AppAllowlistGuard(db, AuditLogger(db))
@@ -81,6 +83,8 @@ def test_app_guard_blocks_scripts_lolbins_and_bad_args(tmp_path: Path) -> None:
         with pytest.raises(AppAccessDeniedError):
             guard.validate_registration(r"\\192.168.1.10\share\evil.exe", ["evil.exe"])
         with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(r"\\?\UNC\192.168.1.10\share\evil.exe", ["evil.exe"])
+        with pytest.raises(AppAccessDeniedError):
             guard.validate_registration(r"C:\Windows\System32\cmd.exe", ["cmd.exe"])
 
         lolbin = tmp_path / "powershell.exe"
@@ -90,6 +94,10 @@ def test_app_guard_blocks_scripts_lolbins_and_bad_args(tmp_path: Path) -> None:
 
         exe = tmp_path / "SafeApp.exe"
         exe.write_text("bin", encoding="utf-8")
+        with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(f"{exe}:hidden_stream", ["safeapp.exe"])
+        with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(f"\\\\?\\{exe}:hidden_stream", ["safeapp.exe"])
         with pytest.raises(AppAccessDeniedError):
             guard.validate_registration(str(exe), ["safeapp.exe"], launch_args=["--x & calc.exe"])
         with pytest.raises(AppAccessDeniedError):
@@ -104,6 +112,8 @@ def test_app_guard_blocks_scripts_lolbins_and_bad_args(tmp_path: Path) -> None:
             guard.validate_registration(str(exe), [])
         with pytest.raises(AppAccessDeniedError):
             guard.validate_registration(str(exe), ["cmd.exe"])
+        with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(str(exe), ["cmd"])
 
         resolved = guard.validate_registration(
             str(exe),
@@ -111,6 +121,29 @@ def test_app_guard_blocks_scripts_lolbins_and_bad_args(tmp_path: Path) -> None:
             launch_args=["--profile", "default"],
         )
         assert resolved == exe.resolve(strict=True)
+
+        long_resolved = guard.validate_registration(f"\\\\?\\{exe}", ["SafeApp.exe"])
+        assert long_resolved.name == "SafeApp.exe"
+
+        # Symlink / resolved-target enforcement: innocent .exe alias resolving to .bat or LOLBIN must fail.
+        alias_exe = tmp_path / "alias.exe"
+        alias_exe.write_text("alias", encoding="utf-8")
+        orig_resolve = Path.resolve
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda self, strict=False: bat if self == alias_exe else orig_resolve(self, strict=strict),
+        )
+        with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(str(alias_exe), ["alias.exe"])
+
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda self, strict=False: lolbin if self == alias_exe else orig_resolve(self, strict=strict),
+        )
+        with pytest.raises(AppAccessDeniedError):
+            guard.validate_registration(str(alias_exe), ["alias.exe"])
 
         blocked = db.list_audits(decision="BLOCKED")
         assert any(entry.event_type == "APP_REGISTER" for entry in blocked)

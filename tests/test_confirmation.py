@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -7,29 +8,55 @@ from jawis.security.confirmation import ConfirmationManager, TargetProcess
 
 def test_voice_confirmation_parser_handles_negation_and_interrogatives() -> None:
     assert ConfirmationManager.parse_voice_confirmation("ยืนยันครับ") == "approve"
+    assert ConfirmationManager.parse_voice_confirmation("ยืนยันค่ะ") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("Confirm") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("ปิดเลย") == "approve"
+    assert ConfirmationManager.parse_voice_confirmation("ปิดเลยครับ") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("ตกลงค่ะ") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("โอเคเลย") == "approve"
+    assert ConfirmationManager.parse_voice_confirmation("ได้เลยครับ") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("Yes, proceed") == "approve"
     assert ConfirmationManager.parse_voice_confirmation("ยกเลิกครับ") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("No, keep it") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("ไม่") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("ไม่ครับ") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("ไม่ confirm") == "cancel"
-    # False-positive traps that MUST NOT approve!
+    # Colloquial Thai interrogatives & false-positive traps that MUST NOT approve!
     assert ConfirmationManager.parse_voice_confirmation("") is None
     assert ConfirmationManager.parse_voice_confirmation("ใช่ไหม") is None
     assert ConfirmationManager.parse_voice_confirmation("ยืนยันการปิด Chrome ไหมครับ") is None
     assert ConfirmationManager.parse_voice_confirmation("ยืนยันหรือไม่") is None
     assert ConfirmationManager.parse_voice_confirmation("ยืนยันมั้ย") is None
+    assert ConfirmationManager.parse_voice_confirmation("ยืนยันมั๊ย") is None
+    assert ConfirmationManager.parse_voice_confirmation("ใช่หรอ") is None
+    assert ConfirmationManager.parse_voice_confirmation("ยืนยันหรอ") is None
+    assert ConfirmationManager.parse_voice_confirmation("ใช่เปล่า") is None
+    assert ConfirmationManager.parse_voice_confirmation("โอเคเปล่า") is None
+    assert ConfirmationManager.parse_voice_confirmation("ใช่ป่ะ") is None
     assert ConfirmationManager.parse_voice_confirmation("Confirm?") is None
+    # Trailing Thai negations/hesitations starting with approval words MUST NOT approve!
+    assert ConfirmationManager.parse_voice_confirmation("โอเค งั้นไม่") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("ยืนยันว่าอย่าทำ") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("ตกลงยังไม่อยากปิด") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("อย่ายืนยัน") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("ไม่ยืนยัน") == "cancel"
+    # English negations and refusals MUST cancel!
     assert ConfirmationManager.parse_voice_confirmation("don't confirm") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("don’t confirm") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("do not confirm") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("not confirmed") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("won't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("won’t confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("cannot confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("can't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("never confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("didn't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("shouldn't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("wouldn't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("couldn't confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("I refuse to confirm") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("decline") == "cancel"
+    assert ConfirmationManager.parse_voice_confirmation("deny") == "cancel"
     assert ConfirmationManager.parse_voice_confirmation("unconfirmed") is None
     assert ConfirmationManager.parse_voice_confirmation("yesterday") is None
     assert ConfirmationManager.parse_voice_confirmation("I know") is None
@@ -135,3 +162,70 @@ async def test_confirmation_supersede_active_expiry_and_missing() -> None:
     res4 = await short_mgr.wait_for_decision(req4.confirm_id)
     assert res4.decision == "timeout"
     assert res4.source == "timer"
+
+
+@pytest.mark.asyncio
+async def test_confirmation_cross_thread_resolve_wakes_loop_cleanly() -> None:
+    loop = asyncio.get_running_loop()
+    prev_debug = loop.get_debug()
+    loop.set_debug(True)
+    try:
+        mgr = ConfirmationManager(timeout_seconds=1.5)
+        req = mgr.create_request(
+            action="close_app",
+            app_id=5,
+            app_key="chrome",
+            display_name="Google Chrome",
+            target_processes=[TargetProcess(pid=999, create_time=50.0, process_name="chrome.exe")],
+        )
+        assert isinstance(req.target_processes, tuple)
+
+        resolve_outcomes: list[bool] = []
+
+        def worker() -> None:
+            threading.Event().wait(0.03)
+            resolve_outcomes.append(mgr.resolve(req.confirm_id, "approve", source="hud"))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        result = await mgr.wait_for_decision(req.confirm_id)
+        thread.join(timeout=1.0)
+
+        assert resolve_outcomes == [True]
+        assert result.decision == "approve"
+        assert result.source == "hud"
+
+        # Immediate expired check inside wait_for_decision (without active_request pre-pruning)
+        tiny_mgr = ConfirmationManager(timeout_seconds=0.02)
+        req_exp = tiny_mgr.create_request(
+            action="close_app",
+            app_id=6,
+            app_key="notepad",
+            display_name="Notepad",
+            target_processes=[],
+        )
+        await asyncio.sleep(0.04)
+        expired_res = await tiny_mgr.wait_for_decision(req_exp.confirm_id)
+        assert expired_res.decision == "timeout"
+        assert expired_res.source == "timer"
+    finally:
+        loop.set_debug(prev_debug)
+
+
+def test_confirmation_closed_loop_resolve() -> None:
+    closed_mgr = ConfirmationManager(timeout_seconds=5.0)
+    temp_loop = asyncio.new_event_loop()
+    try:
+        async def make_req():
+            return closed_mgr.create_request(
+                action="close_app",
+                app_id=7,
+                app_key="calc",
+                display_name="Calculator",
+                target_processes=[],
+            )
+
+        closed_req = temp_loop.run_until_complete(make_req())
+    finally:
+        temp_loop.close()
+    assert closed_mgr.resolve(closed_req.confirm_id, "approve", source="hud") is True
