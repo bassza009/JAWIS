@@ -1,0 +1,12 @@
+﻿.superpowers/
+.venv/
+.worktrees/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+dist/
+build/
