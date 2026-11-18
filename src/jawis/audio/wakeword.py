@@ -100,6 +100,7 @@ class OnnxWakeWordEngine:
             if self._model is not None:
                 self._model = None
                 self._sample_accum = np.empty(0, dtype=np.int16)
+                self._last_trigger_ts = None
                 gc.collect()
 
     def status(self) -> dict[str, object]:
@@ -131,11 +132,11 @@ class OnnxWakeWordEngine:
         """Accumulate incoming PCM int16 frames and run 1280-sample ONNX inference."""
         if mono_int16 is None:
             return None
-        flat = np.asarray(mono_int16, dtype=np.int16).reshape(-1)
-        if flat.size == 0:
-            return None
         with self._lock:
             if self._model is None:
+                return None
+            flat = np.asarray(mono_int16, dtype=np.int16).reshape(-1)
+            if flat.size == 0:
                 return None
             self._sample_accum = np.concatenate((self._sample_accum, flat))
             triggered: str | None = None

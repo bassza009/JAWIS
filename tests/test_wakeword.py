@@ -65,9 +65,15 @@ def test_wakeword_handles_missing_dependency_gracefully(tmp_path: Path) -> None:
     assert "missing onnx" in str(status["detail"])
 
 
-def test_wakeword_lazy_import_and_graceful_missing_optional_packages(tmp_path: Path) -> None:
+def test_wakeword_lazy_import_and_graceful_missing_optional_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     assert "openwakeword" not in sys.modules
     assert "onnxruntime" not in sys.modules
+
+    monkeypatch.setitem(sys.modules, "openwakeword", None)
+    monkeypatch.setitem(sys.modules, "openwakeword.model", None)
+    monkeypatch.setitem(sys.modules, "openwakeword.utils", None)
 
     cfg = load_config(tmp_path)
     engine = OnnxWakeWordEngine(cfg)
@@ -130,6 +136,11 @@ def test_wakeword_threshold_and_cooldown_with_small_monotonic(
 
     # After cooldown expires -> triggers again
     now[0] = 2.3
+    assert engine.process_frame(frame) == "hey_jarvis"
+
+    # Unload clears cooldown state so reload triggers immediately
+    engine.unload()
+    assert engine.load() is True
     assert engine.process_frame(frame) == "hey_jarvis"
 
 
